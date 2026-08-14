@@ -647,3 +647,102 @@ async fn terminate_detached_tasks_for_session_kills_process_group() -> Result<()
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminate_detached_tasks_scopes_to_owning_session_and_pid() -> Result<()> {
+    use std::process::Stdio;
+
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    let spawn_detached_sleeper = || {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = crate::platform::spawn_detached(&mut cmd).expect("spawn detached child");
+        child
+    };
+
+    // Task A: detached, owned by the stopped session -> must be killed.
+    let mut child_a = spawn_detached_sleeper();
+    let pid_a = child_a.id();
+    let info_a = manager.reserve_task_info();
+    manager
+        .register_detached_task(
+            &info_a,
+            "bash",
+            Some("cargo test".to_string()),
+            "session-stop-a",
+            pid_a,
+            &Utc::now().to_rfc3339(),
+            false,
+            false,
+        )
+        .await;
+
+    // Task B: detached but owned by a *different* session -> must survive.
+    let mut child_b = spawn_detached_sleeper();
+    let pid_b = child_b.id();
+    let info_b = manager.reserve_task_info();
+    manager
+        .register_detached_task(
+            &info_b,
+            "bash",
+            Some("cargo test".to_string()),
+            "session-other",
+            pid_b,
+            &Utc::now().to_rfc3339(),
+            false,
+            false,
+        )
+        .await;
+
+    // Task C: detached status file for the stopped session but no pid -> skipped.
+    let mut no_pid = running_status_fixture("c-nopid1aaaa", "session-stop-a");
+    no_pid.detached = true;
+    write_status_fixture(&manager, &no_pid).await;
+
+    // Stopping session A must terminate only its pid-bearing detached tasks.
+    let terminated = manager
+        .terminate_detached_tasks_for_session("session-stop-a")
+        .await;
+    assert_eq!(terminated, 1, "only session A's detached task is terminated");
+
+    let _ = child_a.wait();
+    assert!(
+        !crate::platform::is_process_running(pid_a),
+        "session A's process should be killed"
+    );
+    let status_a = manager
+        .status(&info_a.task_id)
+        .await
+        .ok_or_else(|| anyhow!("status A should exist"))?;
+    assert_eq!(status_a.status, BackgroundTaskStatus::Failed);
+
+    // Task B keeps running with an untouched Running status.
+    assert!(
+        crate::platform::is_process_running(pid_b),
+        "other session's process must survive"
+    );
+    let status_b = manager
+        .status(&info_b.task_id)
+        .await
+        .ok_or_else(|| anyhow!("status B should exist"))?;
+    assert_eq!(status_b.status, BackgroundTaskStatus::Running);
+
+    // The no-pid entry is not enumerated at all (not counted, not mutated).
+    let status_c = manager
+        .status("c-nopid1aaaa")
+        .await
+        .ok_or_else(|| anyhow!("status C should exist"))?;
+    assert_eq!(status_c.status, BackgroundTaskStatus::Running);
+
+    // Cleanup: stop and reap B so the test leaves no stray processes.
+    let _ = crate::platform::signal_detached_process_group(pid_b, libc::SIGKILL);
+    let _ = child_b.wait();
+    Ok(())
+}
