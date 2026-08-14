@@ -1265,4 +1265,9 @@ async fn handle_comm_stop_terminates_detached_tasks_of_stopped_worker() {
         .await
         .expect("status file should exist");
     assert_eq!(status.status, crate::bus::BackgroundTaskStatus::Failed);
+
+    // Clean up the global manager's status/output files so this test leaves
+    // no residue in /tmp/jcode-bg-tasks for other tests or real runs.
+    let _ = std::fs::remove_file(manager.status_path_for(&info.task_id));
+    let _ = std::fs::remove_file(manager.output_path_for(&info.task_id));
 }
