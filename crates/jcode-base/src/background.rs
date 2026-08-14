@@ -1445,6 +1445,36 @@ impl BackgroundTaskManager {
         matches.sort_by(|a, b| a.task_id.cmp(&b.task_id));
         matches
     }
+
+    /// Terminate all still-running detached background tasks owned by a session.
+    ///
+    /// Detached tasks are spawned with `setsid()`, so the leader PID doubles as
+    /// the process-group ID and `kill(-pid, ...)` reaches the full descendant
+    /// tree (compilers, test runners, shells). This is used by swarm `stop` so
+    /// that stopping a worker also stops the work it left behind after a server
+    /// reload, instead of leaving reload-persisted commands burning CPU forever.
+    ///
+    /// Status files are marked failed so reload recovery no longer reports them
+    /// as "persisted background task(s) still running" for a dead session.
+    pub async fn terminate_detached_tasks_for_session(&self, session_id: &str) -> usize {
+        let tasks = self.persisted_detached_running_tasks_for_session(session_id);
+        let mut terminated = 0usize;
+        for task in tasks {
+            let Some(pid) = task.pid else {
+                continue;
+            };
+            if crate::platform::signal_detached_process_group(pid, libc::SIGKILL).is_ok() {
+                terminated += 1;
+            }
+            let mut status = task.clone();
+            status.status = BackgroundTaskStatus::Failed;
+            status.error = Some("terminated because its owning session was stopped".to_string());
+            status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            self.write_status_file(&self.status_path_for(&task.task_id), &status)
+                .await;
+        }
+        terminated
+    }
 }
 
 impl Default for BackgroundTaskManager {

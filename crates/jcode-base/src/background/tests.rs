@@ -562,3 +562,88 @@ async fn abort_live_tasks_for_reload_keeps_naturally_finished_status() -> Result
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminate_detached_tasks_for_session_kills_process_group() -> Result<()> {
+    use std::process::Stdio;
+
+    let tmp = tempdir()?;
+    let manager = BackgroundTaskManager::with_output_dir(tmp.path().to_path_buf());
+
+    // Spawn a real detached process group (setsid) that stays alive long
+    // enough for us to kill it, exactly like a reload-persisted bash command.
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("sleep 120")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = crate::platform::spawn_detached(&mut cmd).expect("spawn detached child");
+    let pid = child.id();
+    assert!(
+        crate::platform::is_process_running(pid),
+        "detached process should be running"
+    );
+
+    // Register it as a detached task owned by a session, as the reload
+    // persistence path does.
+    let info = manager.reserve_task_info();
+    manager
+        .register_detached_task(
+            &info,
+            "bash",
+            Some("cargo test".to_string()),
+            "session-stop-me",
+            pid,
+            &Utc::now().to_rfc3339(),
+            false,
+            false,
+        )
+        .await;
+
+    // The session is stopped: all its detached tasks must be terminated.
+    let terminated = manager
+        .terminate_detached_tasks_for_session("session-stop-me")
+        .await;
+    assert_eq!(terminated, 1, "one detached task should be terminated");
+
+    // The process group must actually be dead. The child is still our direct
+    // child here (in production the daemon reaps it), so wait() to collect the
+    // zombie before probing liveness, exactly like a reaping parent would.
+    let _ = child.wait();
+    assert!(
+        !crate::platform::is_process_running(pid),
+        "detached process should have been killed"
+    );
+
+    // The status file must no longer look like a live running task, so reload
+    // recovery does not report it as still running for the dead session.
+    let status = manager
+        .status(&info.task_id)
+        .await
+        .ok_or_else(|| anyhow!("status should exist"))?;
+    assert_eq!(
+        status.status,
+        BackgroundTaskStatus::Failed,
+        "terminated task should be marked failed"
+    );
+    assert!(
+        status
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("session was stopped"),
+        "error should explain the termination reason"
+    );
+    assert!(status.completed_at.is_some());
+
+    // Idempotent: a second sweep finds nothing.
+    assert_eq!(
+        manager
+            .terminate_detached_tasks_for_session("session-stop-me")
+            .await,
+        0
+    );
+    Ok(())
+}

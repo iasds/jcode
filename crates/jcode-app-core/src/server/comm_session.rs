@@ -1090,6 +1090,21 @@ pub(super) async fn handle_comm_stop(
     if let Some(agent_arc) = removed_agent {
         remove_session_interrupt_queue(soft_interrupt_queues, &target_session).await;
         remove_background_tool_signal(&target_session);
+        // Cascade-terminate detached background tasks this session left behind
+        // (e.g. bash commands persisted into the background by a server reload,
+        // like long `cargo test` runs). Without this, stopping a worker only
+        // removes the session while its reload-persisted commands keep running
+        // and re-forking under the daemon, burning CPU until manually killed.
+        // See https://github.com/1jehuang/jcode/issues/940
+        let terminated = crate::background::global()
+            .terminate_detached_tasks_for_session(&target_session)
+            .await;
+        if terminated > 0 {
+            crate::logging::info(&format!(
+                "stop session={} terminated {} detached background task(s)",
+                target_session, terminated
+            ));
+        }
         if let Ok(mut agent) = agent_arc.try_lock() {
             agent.mark_closed();
             let memory_enabled = agent.memory_enabled();
