@@ -1,10 +1,10 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use super::{
-    CoordinatorSpawnIdentity, ensure_spawn_coordinator_swarm, prepare_visible_spawn_session,
-    register_visible_spawned_member, resolve_coordinator_spawn_identity, resolve_spawn_working_dir,
-    resolve_stop_target_session, resolve_swarm_spawn_selection, spawn_admission_lock,
-    swarm_stop_allowed_by_owner,
+    CoordinatorSpawnIdentity, ensure_spawn_coordinator_swarm, handle_comm_stop,
+    prepare_visible_spawn_session, register_visible_spawned_member,
+    resolve_coordinator_spawn_identity, resolve_spawn_working_dir, resolve_stop_target_session,
+    resolve_swarm_spawn_selection, spawn_admission_lock, swarm_stop_allowed_by_owner,
 };
 use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
@@ -1133,4 +1133,136 @@ async fn spawn_admission_lock_serializes_per_swarm_only() {
             .await
             .is_ok()
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn handle_comm_stop_terminates_detached_tasks_of_stopped_worker() {
+    use crate::background::global as bg_global;
+    use crate::server::{ChannelSubscriptions, SessionInterruptQueues, SwarmMutationRuntime};
+    use chrono::Utc;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let swarm_id = "swarm-stop-e2e";
+    let requester = "coord";
+    let worker = "worker";
+
+    let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+    let worker_agent = test_agent_with_working_dir(worker, "/tmp").await;
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        worker.to_string(),
+        worker_agent,
+    )])));
+    let soft_interrupt_queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        (requester.to_string(), {
+            let (m, _rx) = member(requester, Some(swarm_id), "coordinator");
+            let mut m = m;
+            m.report_back_to_session_id = Some(requester.to_string());
+            m
+        }),
+        (worker.to_string(), {
+            let (m, _rx) = member(worker, Some(swarm_id), "agent");
+            let mut m = m;
+            m.report_back_to_session_id = Some(requester.to_string());
+            m
+        }),
+    ])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.to_string(),
+        HashSet::from([requester.to_string(), worker.to_string()]),
+    )])));
+    let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.to_string(),
+        requester.to_string(),
+    )])));
+    let swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let channel_subscriptions: ChannelSubscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let channel_subscriptions_by_session: ChannelSubscriptions = Arc::new(RwLock::new(HashMap::new()));
+    let event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(1));
+    let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let mutation_runtime = SwarmMutationRuntime::default();
+
+    // Simulate a reload-persisted command: a real detached process group
+    // registered as the worker's background task.
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("sleep 120")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = crate::platform::spawn_detached(&mut cmd).expect("spawn detached child");
+    let pid = child.id();
+    let manager = bg_global();
+    let info = manager.reserve_task_info();
+    manager
+        .register_detached_task(
+            &info,
+            "bash",
+            Some("cargo test".to_string()),
+            worker,
+            pid,
+            &Utc::now().to_rfc3339(),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        crate::platform::is_process_running(pid),
+        "detached process should be running before stop"
+    );
+
+    // Stop the worker through the real handler path (swarm stop action).
+    handle_comm_stop(
+        200,
+        requester.to_string(),
+        worker.to_string(),
+        false,
+        &client_tx,
+        &sessions,
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_coordinators,
+        &swarm_plans,
+        &channel_subscriptions,
+        &channel_subscriptions_by_session,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &soft_interrupt_queues,
+        &mutation_runtime,
+    )
+    .await;
+
+    // The response should be a success (Done), not an error.
+    let mut saw_response = false;
+    while let Ok(event) = tokio::time::timeout(Duration::from_millis(2000), client_rx.recv()).await {
+        match event.expect("channel open") {
+            ServerEvent::Error { message, .. } => panic!("stop failed: {message}"),
+            ServerEvent::Done { id } => {
+                assert_eq!(id, 200);
+                saw_response = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(saw_response, "no stop response received");
+
+    // The worker's detached process group must have been terminated.
+    let _ = child.wait();
+    assert!(
+        !crate::platform::is_process_running(pid),
+        "detached process should be killed by swarm stop"
+    );
+
+    // Status file must be marked failed so reload recovery ignores it.
+    let status = manager
+        .status(&info.task_id)
+        .await
+        .expect("status file should exist");
+    assert_eq!(status.status, crate::bus::BackgroundTaskStatus::Failed);
 }
