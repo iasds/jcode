@@ -287,8 +287,15 @@ fn message_to_text(msg: &Message) -> String {
 fn extract_snippet(text: &str, query: &str) -> String {
     let lower = text.to_lowercase();
     if let Some(pos) = lower.find(query) {
-        let start = pos.saturating_sub(50);
-        let end = (pos + query.len() + 50).min(text.len());
+        // Byte offsets from `find` on the lowercased copy can land mid-UTF-8
+        // (CJK chars are 3 bytes); slicing `text` at those raw offsets panics.
+        // Clamp both ends onto char boundaries first. Note `lower.len()` can
+        // differ from `text.len()` for non-ASCII, so clamp against both.
+        let start = floor_char_boundary(text, pos.saturating_sub(50));
+        let end = ceil_char_boundary(
+            text,
+            (pos + query.len() + 50).min(lower.len()).min(text.len()),
+        );
         let mut snippet = text[start..end].to_string();
         if start > 0 {
             snippet = format!("...{}", snippet);
@@ -300,6 +307,30 @@ fn extract_snippet(text: &str, query: &str) -> String {
     } else {
         text.chars().take(100).collect()
     }
+}
+
+/// Largest byte index `<= index` that is a UTF-8 char boundary in `text`.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+/// Smallest byte index `>= index` that is a UTF-8 char boundary in `text`.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary < text.len() && !text.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
 }
 
 #[cfg(test)]
@@ -398,5 +429,29 @@ mod tests {
         let result = tool.execute(input, ctx).await.unwrap();
         assert!(result.output.contains("No turns found"));
         restore_env(base, previous_home);
+    }
+
+    /// Regression: `extract_snippet` used to slice the original text at byte
+    /// offsets found in its lowercased copy; for CJK (3-byte chars) the offset
+    /// can land mid-char and panic ("not a char boundary"). The lowercase of
+    /// some non-ASCII strings also differs in byte length from the original,
+    /// so end offsets must be clamped against both lengths.
+    #[test]
+    fn test_extract_snippet_cjk_char_boundaries() {
+        // Match lands right after a multi-byte char at both cut edges.
+        let text = "前情提要（这是一段很长的中文上下文用于触发字节越界切片panic的场景）后续内容继续补充足够长度以便两侧裁剪都落在多字节字符中间测试完毕";
+        let snippet = extract_snippet(text, "panic的场景");
+        assert!(snippet.contains("panic的场景"));
+
+        // ASCII query whose position sits between CJK chars on both sides.
+        let text2 = "中文标记abc中文字符串继续延长确保前后各五十字节范围内全部是多字节汉字字符填充填充填充填充";
+        let snippet2 = extract_snippet(text2, "abc");
+        assert!(snippet2.contains("abc"));
+
+        // Lowercased form longer than the original (İ -> i̇ expands bytes):
+        // end clamp must not exceed either length.
+        let text3 = "İNDEKS".repeat(30);
+        let snippet3 = extract_snippet(&text3, "i̇ndeks");
+        assert!(!snippet3.is_empty());
     }
 }
