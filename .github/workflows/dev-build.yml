@@ -1,0 +1,75 @@
+name: Dev build (pinned model allowlist)
+
+# Minimal fork-local release build for the "pinned provider model allowlist"
+# dev binary. Avoids the upstream release pipeline's private secrets
+# (DEPLOY_KEY, AUR, Homebrew), builds only Linux x86_64, and attaches an
+# obviously-named "-dev" asset to the v0.81.1-dev tag's release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-dev'
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      JCODE_RELEASE_BUILD: "1"
+      JCODE_CI_BUILD: "1"
+      JCODE_BUILD_SEMVER: ${{ github.ref_name }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache (optional)
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Configure mold linker and build
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mold clang
+          mkdir -p .cargo
+          cat > .cargo/config.toml << 'EOF'
+          [target.x86_64-unknown-linux-gnu]
+          linker = "clang"
+          rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+          EOF
+          if command -v sccache &>/dev/null && sccache --start-server 2>/dev/null; then
+            export RUSTC_WRAPPER=sccache
+            export SCCACHE_GHA_ENABLED=true
+          fi
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package -dev asset
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          BIN="jcode-${VER}-linux-x86_64"
+          cp "target/x86_64-unknown-linux-gnu/release/jcode" "dist/$BIN"
+          chmod +x "dist/$BIN"
+          cd dist && tar czf "$BIN.tar.gz" "$BIN"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-${{ github.ref_name }}-linux-x86_64
+          path: dist/*.tar.gz
+
+      - name: Attach asset to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz --clobber || true
