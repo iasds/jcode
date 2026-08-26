@@ -1,0 +1,11 @@
+{
+  "version": "0.81.1-dev",
+  "date": "2026-08-26",
+  "title": "Dev build: pinned provider model allowlist",
+  "highlights": [
+    "OpenAI-compatible built-in profiles now honor your pinned [providers.<id>] model allowlist; broken or unreleased gateway models no longer surface in the model picker or fallback candidates (fixes 503 / \"service_overloaded\" provider errors)."
+  ],
+  "fixes": [
+    "Stop selecting fail-to-respond gateway models when the live model catalog is disabled."
+  ]
+}
