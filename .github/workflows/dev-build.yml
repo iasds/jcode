@@ -20,7 +20,7 @@ jobs:
     env:
       JCODE_RELEASE_BUILD: "1"
       JCODE_CI_BUILD: "1"
-      JCODE_BUILD_SEMVER: ${{ github.ref_name }}
+      JCODE_BUILD_SEMVER: "v0.81.1-dev"
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
