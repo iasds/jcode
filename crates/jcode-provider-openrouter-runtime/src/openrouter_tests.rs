@@ -3207,3 +3207,89 @@ fn named_openai_compatible_provider_keeps_stable_name_and_profile_display_name()
     assert_eq!(provider.runtime_display_name(), "example-compat");
     assert_eq!(Provider::display_name(&provider), "example-compat");
 }
+
+#[test]
+fn picker_allowlist_gated_by_named_override_for_builtin_profile() {
+    // The [providers.opencode-go] override block (model_catalog=false + a
+    // pinned allowlist) must gate what the production picker surfaces for the
+    // built-in opencode-go profile, exercising the exact constructor the
+    // composition root uses for the active provider
+    // (OpenRouterRuntimeSpec::CompatibleProfile -> new_openai_compatible_profile_runtime).
+    // Broken gateway models like muse-spark-1.2-contributor must never appear.
+    let _lock = ENV_LOCK.lock();
+    let temp = TempDir::new().expect("create temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let _home = EnvVarGuard::set("HOME", temp.path());
+    let _appdata = EnvVarGuard::set("APPDATA", temp.path().join("AppData").join("Roaming"));
+    let _env = isolate_openrouter_autodetect_env();
+    let _key = EnvVarGuard::set("OPENCODE_GO_API_KEY", "picker-allowlist-test-key");
+
+    std::fs::create_dir_all(&jcode_home).expect("create jcode home");
+    std::fs::write(
+        jcode_home.join("config.toml"),
+        r#"
+default_provider = "opencode-go"
+
+[providers.opencode-go]
+type = "open-ai-compatible"
+base_url = "https://opencode.ai/zen/go/v1"
+auth = "bearer"
+api_key_env = "OPENCODE_GO_API_KEY"
+model_catalog = false
+
+[[providers.opencode-go.models]]
+id = "ox-alpha-free"
+
+[[providers.opencode-go.models]]
+id = "minimax-m3"
+
+[[providers.opencode-go.models]]
+id = "kimi-k3"
+
+[[providers.opencode-go.models]]
+id = "glm-5.3"
+
+[[providers.opencode-go.models]]
+id = "deepseek-v4-pro"
+"#,
+    )
+    .expect("write config.toml");
+
+    let profile = jcode_base::provider_catalog::openai_compatible_profile_by_id("opencode-go")
+        .expect("built-in opencode-go profile exists");
+    let runtime = OpenRouterProvider::new_openai_compatible_profile_runtime(profile)
+        .expect("construct opencode-go runtime");
+
+    let allowlist: std::collections::HashSet<&str> =
+        ["ox-alpha-free", "minimax-m3", "kimi-k3", "glm-5.3", "deepseek-v4-pro"]
+            .into_iter()
+            .collect();
+    let displayed = runtime.available_models_display();
+    assert!(
+        !displayed.is_empty(),
+        "pinned allowlist must not collapse to an empty picker"
+    );
+    for model in &displayed {
+        // The current default model may be pinned in front, but every other
+        // entry must come from the allowlist.
+        if model != &runtime.model() {
+            assert!(
+                allowlist.contains(model.as_str()),
+                "picker leaked non-allowlisted model: {model}"
+            );
+        }
+        assert_ne!(model, "muse-spark-1.2-contributor", "broken gateway model leaked");
+    }
+    for allowed in &allowlist {
+        assert!(
+            displayed.iter().any(|model| model == allowed),
+            "allowlisted model missing from picker: {allowed}"
+        );
+    }
+    assert!(
+        displayed.len() <= allowlist.len() + 1,
+        "picker should show at most allowlist + current model, got {}",
+        displayed.len()
+    );
+}
