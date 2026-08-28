@@ -180,10 +180,20 @@ fn direct_openai_compatible_profile_routes(
 ) -> Vec<ModelRoute> {
     let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
     let static_models = crate::provider_catalog::openai_compatible_profile_static_models(profile);
+    // A user override block ([providers.<id>]) with model_catalog=false and
+    // an explicit static allowlist opts out of the live gateway catalog:
+    // broken or unreleased gateway models must never surface in the picker.
+    // The active-provider runtime already applies this rule; honor it here
+    // for the non-active configured-profile path too.
+    let live_catalog_opt_out = crate::config::config()
+        .providers
+        .get(&resolved.id)
+        .is_some_and(|cfg| !cfg.model_catalog && !cfg.models.is_empty());
     // Pure read: the catalog scheduler owns refresh cadence, so rendering
     // routes cannot fan out HTTP requests.
-    let (mut models, from_live_catalog) = if let Some((models, _cache_is_stale)) =
-        cached_live_models_for_openai_compatible_profile(&resolved)
+    let (mut models, from_live_catalog) = if !live_catalog_opt_out
+        && let Some((models, _cache_is_stale)) =
+            cached_live_models_for_openai_compatible_profile(&resolved)
     {
         (models, true)
     } else {
