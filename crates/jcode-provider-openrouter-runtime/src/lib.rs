@@ -1653,7 +1653,31 @@ impl OpenRouterProvider {
         };
 
         let static_context_limits = openai_compatible_profile_static_context_limits(profile);
-        let static_models = openai_compatible_profile_static_models(profile);
+        // Honor an explicit [providers.<id>] override block for this built-in
+        // profile. When the user pins a model allowlist and disables the live
+        // model catalog, use exactly that allowlist so broken or unreleased
+        // gateway models never surface in the picker or fallback candidates.
+        let named_override = jcode_base::config::config()
+            .providers
+            .get(profile.id)
+            .filter(|cfg| {
+                cfg.provider_type
+                    == jcode_base::config::NamedProviderType::OpenAiCompatible
+            });
+        let (supports_model_catalog, static_models) = match named_override {
+            Some(cfg) => {
+                let models = if cfg.models.is_empty() {
+                    openai_compatible_profile_static_models(profile)
+                } else {
+                    cfg.models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                (cfg.model_catalog, models)
+            }
+            None => (true, openai_compatible_profile_static_models(profile)),
+        };
         let model = resolved
             .default_model
             .clone()
@@ -1669,7 +1693,7 @@ impl OpenRouterProvider {
             api_base,
             auth,
             supports_provider_features: false,
-            supports_model_catalog: true,
+            supports_model_catalog,
             profile_id: Some(resolved.id.clone()),
             reasoning_effort_support: None,
             max_tokens: Self::configured_max_tokens(Some(&resolved.id)),
