@@ -22,8 +22,6 @@ const SIDECAR_OPENAI_OAUTH_FALLBACK_REASONING: &str = "low";
 /// Fast/cheap Claude model used when only Claude credentials are available.
 const SIDECAR_CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// OpenAI Responses API
-const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 const CHATGPT_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const OPENAI_RESPONSES_PATH: &str = "responses";
 const OPENAI_ORIGINATOR: &str = "codex_cli_rs";
@@ -305,9 +303,13 @@ impl Sidecar {
 
         let is_chatgpt_mode = !creds.refresh_token.is_empty() || creds.id_token.is_some();
         let base = if is_chatgpt_mode {
-            CHATGPT_API_BASE
+            CHATGPT_API_BASE.to_string()
         } else {
-            OPENAI_API_BASE
+            // Honor JCODE_OPENAI_API_BASE / OPENAI_BASE_URL / OPENAI_API_BASE
+            // (and ~/.codex/config.toml responses base) just like the
+            // openai-api provider: a configured OpenAI-compatible gateway is
+            // where the API key is valid, not necessarily api.openai.com.
+            crate::provider::openai::resolve_api_base()
         };
         let url = format!("{}/{}", base.trim_end_matches('/'), OPENAI_RESPONSES_PATH);
 
