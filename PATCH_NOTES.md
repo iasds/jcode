@@ -70,3 +70,26 @@ launcher `jcode`（505B sh）exec 同目录 `jcode-linux-x86_64.bin`；dev-build
 备份：`config.toml.bak-allowlist` / `config.toml.bak-defaultmodel`。
 **勿把 ox-alpha-free 加回 allowlist 或 default_model**；用户自定义 allowlist 只应包含网关
 真实存在的模型（验证命令见上）。
+
+## v0.81.3-dev：memory sidecar 尊重 OpenAI base override（2026-08-28）
+
+**症状**：每个会话持续报 `Memory consensus judge permanently misconfigured ... 401 Unauthorized
+Incorrect API key provided: sk-hlONY...`。
+
+**根因**：`crates/jcode-base/src/sidecar.rs` 的 `complete_openai` 硬编码
+`https://api.openai.com/v1`（API-key 模式），而 daemon 的 openai-api provider 走
+`JCODE_OPENAI_API_BASE=https://opencode.ai/zen/go/v1`，用的同一个 key（openai.env 的
+OPENAI_API_KEY = opencode-go 网关 key）→ 拿网关 key 打 api.openai.com → 必 401。
+
+**修复**：API-key 模式改走 `crate::provider::openai::resolve_api_base()`（依次尊重
+JCODE_OPENAI_API_BASE / OPENAI_BASE_URL / OPENAI_API_BASE / ~/.codex/config.toml responses
+base，最后回落 api.openai.com），与 openai-api provider 保持一致。顺手删掉不再使用的
+`OPENAI_API_BASE` 常量。提交 `69d6619`，tag `v0.81.3-dev`，已部署 `versions/0.81.3`。
+
+**验证**：日志出现 `Memory consensus rerank: 2/2 judges`（修复前必 401），
+`openai-api:muse-spark-1.2-contributor` 仍 MUSE_V3 ✅。
+
+**遗留噪音（非本次任务）**：内置 openai 槽的后台 catalog sweep 仍用网关 key 打
+api.openai.com/v1/models → 周期 401 INFO（仅日志噪音，用户无 OpenAI 平台凭据；
+/ model 的 OpenAI 分类为空属预期）。要消除可把 `model_picker_providers` 里的 `"openai"`
+移除。
