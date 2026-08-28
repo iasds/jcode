@@ -59,3 +59,14 @@ launcher `jcode`（505B sh）exec 同目录 `jcode-linux-x86_64.bin`；dev-build
 上游发新版（如 v0.82.0）时：rebase 本分支到新上游，把 `43daecb` 与 `4e4fa50` 的改动
 重新落到对应行号（两处逻辑都以 `config().providers.get(profile.id)` 为准绳），
 `dev-build.yml` 的 `JCODE_BUILD_SEMVER` 改成新版本号，重打 `v0.82.0-dev`。
+## 附带修复：config 里的 ox-alpha-free 陷阱（2026-08-28 追加）
+
+诊断时发现 `~/.jcode/config.toml` 有 **两处** `ox-alpha-free`：
+1. `[providers.opencode-go.models]` allowlist 第一条
+2. `[provider] default_model`（全局默认！每个新会话首请求必挂 "Model ox-alpha-free is not supported"）
+
+**`ox-alpha-free` 不在网关目录**（https://opencode.ai/zen/go/v1/models 实测 32 个模型无它），
+疑似 OpenCode 其他产品线的旧模型名。两处均已替换为 `qwen3.7-max`（网关实测可用），
+备份：`config.toml.bak-allowlist` / `config.toml.bak-defaultmodel`。
+**勿把 ox-alpha-free 加回 allowlist 或 default_model**；用户自定义 allowlist 只应包含网关
+真实存在的模型（验证命令见上）。
